@@ -1,96 +1,48 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <sys/select.h>
 
+#include "zenoh.h"
 #include "mtf01.h"
 #include "config.h"
 #include "serial.h"
 
 static volatile int g_running = 1;
-
-/* frequency tracking */
-static uint32_t       g_pkt_in_window = 0;
-static struct timeval g_window_start;
-static double         g_freq_hz = 0.0;
-
-/* totals */
-static uint64_t g_total_bytes   = 0;
-static uint64_t g_total_packets = 0;
-
-/* latest decoded payload */
-static int                             g_has_data = 0;
-static MICOLINK_PAYLOAD_RANGE_SENSOR_t g_latest;
-
-/* capture first 64 raw bytes for diagnostics */
-#define HEX_CAP 64
-static uint8_t g_hex_buf[HEX_CAP];
-static int     g_hex_len = 0;
-
 static void on_signal(int sig) { (void)sig; g_running = 0; }
 
-static void on_range_data(const MICOLINK_PAYLOAD_RANGE_SENSOR_t *p)
+static double now_sec(void)
 {
-    struct timeval now;
-    gettimeofday(&now, NULL);
-
-    g_pkt_in_window++;
-    g_total_packets++;
-
-    double elapsed = (now.tv_sec  - g_window_start.tv_sec) +
-                     (now.tv_usec - g_window_start.tv_usec) / 1e6;
-    if (elapsed >= 1.0) {
-        g_freq_hz       = g_pkt_in_window / elapsed;
-        g_pkt_in_window = 0;
-        g_window_start  = now;
-    }
-
-    g_latest   = *p;
-    g_has_data = 1;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec / 1e6;
 }
 
-static void print_data(void)
+static void print_sensor(const MICOLINK_PAYLOAD_RANGE_SENSOR_t *p, double freq_hz)
 {
     printf("\033[2J\033[H");
-    printf("=== MTF-01 Sensor ===\n\n");
-
-    if (!g_has_data) {
-        MICOLINK_Stats_t st;
-        micolink_get_stats(&st);
-
-        printf("  Waiting for packets...\n\n");
-        printf("  rx bytes         = %llu\n",   (unsigned long long)g_total_bytes);
-        printf("  headers (0xEF)   = %u\n",     st.headers_found);
-        printf("  checksum errors  = %u\n",     st.checksum_errors);
-        printf("  valid packets    = %u\n\n",   st.valid_packets);
-
-        if (g_hex_len > 0) {
-            printf("  First %d bytes (raw hex):\n  ", g_hex_len);
-            for (int i = 0; i < g_hex_len; i++) {
-                printf("%02X ", g_hex_buf[i]);
-                if ((i + 1) % 16 == 0 && i + 1 < g_hex_len)
-                    printf("\n  ");
-            }
-            printf("\n");
-        }
-        return;
-    }
-
-    printf("  distance           = %u mm\n",       g_latest.distance);
-    printf("  distance strength  = %u\n",           g_latest.strength);
-    printf("  distance precision = %u\n",           g_latest.precision);
-    printf("  distance status    = %u\n",           g_latest.dis_status);
-    printf("  flow velocity x    = %d cm/s@1m\n",  g_latest.flow_vel_x);
-    printf("  flow velocity y    = %d cm/s@1m\n",  g_latest.flow_vel_y);
-    printf("  flow quality       = %u\n",           g_latest.flow_quality);
-    printf("  flow status        = %u\n",           g_latest.flow_status);
+    printf("=== MTF-01 Sensor  (%.1f Hz) ===\n\n", freq_hz);
+    printf("  Rangefinder\n");
+    printf("    distance  = %u mm   [status=%u  strength=%u]\n",
+           p->distance, p->dis_status, p->strength);
     printf("\n");
-    printf("  Frequency          = %.1f Hz\n",     g_freq_hz);
-    printf("  time_ms            = %u ms\n",        g_latest.time_ms);
-    printf("  total packets      = %llu\n",         (unsigned long long)g_total_packets);
+    printf("  Optical Flow\n");
+    printf("    vel x     = %d cm/s@1m\n", p->flow_vel_x);
+    printf("    vel y     = %d cm/s@1m\n", p->flow_vel_y);
+    printf("    quality   = %u   [status=%u]\n", p->flow_quality, p->flow_status);
+    printf("\n");
+    printf("  time_ms     = %u ms\n", p->time_ms);
     fflush(stdout);
+}
+
+static int make_json(const MICOLINK_PAYLOAD_RANGE_SENSOR_t *p, char *buf, size_t len)
+{
+    return snprintf(buf, len,
+        "{\"time_ms\":%u,\"distance_mm\":%u,\"dis_status\":%u,\"strength\":%u,"
+        "\"flow_vel_x\":%d,\"flow_vel_y\":%d,\"flow_quality\":%u,\"flow_status\":%u}",
+        p->time_ms, p->distance, (unsigned)p->dis_status, (unsigned)p->strength,
+        p->flow_vel_x, p->flow_vel_y, (unsigned)p->flow_quality, (unsigned)p->flow_status);
 }
 
 int main(int argc, char *argv[])
@@ -102,7 +54,10 @@ int main(int argc, char *argv[])
         if (config_load("config.cfg", &cfg) != 0)
             fprintf(stderr, "Warning: config not found, using defaults\n");
 
-    printf("Port: %s  Baud: %d\n", cfg.port, cfg.baud_rate);
+    if (cfg.sensor_hz <= 0) cfg.sensor_hz = 50;
+
+    printf("Port: %s  Baud: %d  Rate: %d Hz  Zenoh: %s\n",
+           cfg.port, cfg.baud_rate, cfg.sensor_hz, cfg.zenoh_topic);
 
     int fd = serial_open(cfg.port, cfg.baud_rate);
     if (fd < 0) {
@@ -110,51 +65,108 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    micolink_set_range_callback(on_range_data);
+    /* Zenoh session */
+    z_owned_config_t z_cfg;
+    z_config_default(&z_cfg);
+    z_owned_session_t session;
+    if (z_open(&session, z_move(z_cfg), NULL) != Z_OK) {
+        fprintf(stderr, "Failed to open Zenoh session\n");
+        serial_close(fd);
+        return 1;
+    }
+
+    z_view_keyexpr_t keyexpr;
+    z_view_keyexpr_from_str(&keyexpr, cfg.zenoh_topic);
+
+    z_owned_publisher_t publisher;
+    if (z_declare_publisher(z_loan(session), &publisher, z_loan(keyexpr), NULL) != Z_OK) {
+        fprintf(stderr, "Failed to declare Zenoh publisher on '%s'\n", cfg.zenoh_topic);
+        z_close(z_move(session), NULL);
+        serial_close(fd);
+        return 1;
+    }
+
+    micolink_set_range_callback(NULL);   /* poll style */
+
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
 
-    gettimeofday(&g_window_start, NULL);
-    struct timeval last_print = g_window_start;
+    printf("Streaming on zenoh:%s ... Ctrl+C to quit.\n\n", cfg.zenoh_topic);
 
-    printf("Streaming... Ctrl+C to quit.\n\n");
+    /* select timeout = quarter period so we never block longer than 1/4 packet interval */
+    long timeout_us = 1000000L / (cfg.sensor_hz * 4);
 
     uint8_t buf[256];
+    char    json_buf[512];
+    double  window_start = now_sec();
+    double  last_print   = now_sec();
+    uint32_t pkt_window  = 0;
+    double   freq_hz     = 0.0;
+
+    MICOLINK_PAYLOAD_RANGE_SENSOR_t data;
+    uint32_t last_pkt = 0;
+
     while (g_running) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 };
+        struct timeval tv = { .tv_sec = 0, .tv_usec = timeout_us };
 
         int ready = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (ready < 0) { if (!g_running) break; perror("select"); break; }
 
-        if (ready > 0 && FD_ISSET(fd, &rfds)) {
+        if (ready > 0) {
             int n = serial_read(fd, buf, sizeof(buf));
             if (n < 0) { perror("serial_read"); break; }
-
-            /* capture first HEX_CAP bytes for diagnostics */
-            if (g_hex_len < HEX_CAP) {
-                int copy = n < (HEX_CAP - g_hex_len) ? n : (HEX_CAP - g_hex_len);
-                memcpy(g_hex_buf + g_hex_len, buf, copy);
-                g_hex_len += copy;
-            }
-
-            g_total_bytes += (uint64_t)n;
             for (int i = 0; i < n; i++)
                 micolink_decode(buf[i]);
         }
 
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        double since = (now.tv_sec  - last_print.tv_sec) +
-                       (now.tv_usec - last_print.tv_usec) / 1e6;
-        if (since >= 0.1) {
-            print_data();
-            last_print = now;
+        /* publish on every new packet — natural sensor frequency */
+        MICOLINK_Stats_t st;
+        micolink_get_stats(&st);
+        if (st.valid_packets != last_pkt) {
+            pkt_window += st.valid_packets - last_pkt;
+            last_pkt    = st.valid_packets;
+
+            if (micolink_get_data(&data)) {
+                int n = make_json(&data, json_buf, sizeof(json_buf));
+                if (n > 0 && (size_t)n < sizeof(json_buf)) {
+                    z_owned_bytes_t payload;
+                    z_bytes_copy_from_buf(&payload, (const uint8_t *)json_buf, (size_t)n);
+                    z_publisher_put(z_loan(publisher), z_move(payload), NULL);
+                }
+            }
+        }
+
+        /* frequency tracking (1-second rolling window) */
+        double elapsed = now_sec() - window_start;
+        if (elapsed >= 1.0) {
+            freq_hz      = pkt_window / elapsed;
+            pkt_window   = 0;
+            window_start = now_sec();
+        }
+
+        /* console display at 10 Hz */
+        if (now_sec() - last_print >= 0.1) {
+            if (micolink_get_data(&data)) {
+                print_sensor(&data, freq_hz);
+            } else {
+                micolink_get_stats(&st);
+                printf("\033[2J\033[H");
+                printf("=== MTF-01 Sensor ===\n\n");
+                printf("  Waiting for packets...\n\n");
+                printf("  headers found    = %u\n",  st.headers_found);
+                printf("  checksum errors  = %u\n",  st.checksum_errors);
+                printf("  valid packets    = %u\n",  st.valid_packets);
+                fflush(stdout);
+            }
+            last_print = now_sec();
         }
     }
 
+    z_undeclare_publisher(z_move(publisher));
+    z_close(z_move(session), NULL);
     serial_close(fd);
     printf("\nDone.\n");
     return 0;

@@ -1,4 +1,5 @@
 #include "mtf01.h"
+#include <string.h>
 #include <sys/time.h>
 
 /*
@@ -29,9 +30,25 @@ typedef struct {
 static micolink_range_callback_t       g_range_cb;
 static MICOLINK_Stats_t                g_stats;
 static MICOLINK_PAYLOAD_RANGE_SENSOR_t g_data;
+static int                             g_has_data;
 
 void micolink_set_range_callback(micolink_range_callback_t cb) { g_range_cb = cb; }
 void micolink_get_stats(MICOLINK_Stats_t *out)                 { *out = g_stats; }
+
+int micolink_get_data(MICOLINK_PAYLOAD_RANGE_SENSOR_t *out)
+{
+    if (!g_has_data) return 0;
+    *out = g_data;
+    return 1;
+}
+
+void micolink_reset(void)
+{
+    g_range_cb = NULL;
+    g_has_data = 0;
+    memset(&g_stats, 0, sizeof(g_stats));
+    memset(&g_data,  0, sizeof(g_data));
+}
 
 static uint8_t crc8_dvb_s2(uint8_t crc, uint8_t b)
 {
@@ -72,8 +89,10 @@ static void dispatch(const MSP2_t *m)
         break;
 
     default:
-        return; /* unknown function — skip callback */
+        return;
     }
+
+    g_has_data = 1;
 
     if (g_range_cb)
         g_range_cb(&g_data);
@@ -126,8 +145,8 @@ void micolink_decode(uint8_t data)
         m.size     |= (uint16_t)data << 8;
         m.crc_accum = crc8_dvb_s2(m.crc_accum, data);
         m.payload_cnt = 0;
-        if      (m.size == 0)                m.status = 9; /* no payload, go to CRC */
-        else if (m.size > MSP2_MAX_PAYLOAD)  m.status = 0; /* too large, discard    */
+        if      (m.size == 0)                m.status = 9;
+        else if (m.size > MSP2_MAX_PAYLOAD)  m.status = 0;
         else                                 m.status = 8;
         break;
 

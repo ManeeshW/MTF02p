@@ -2,16 +2,12 @@
 #define MTF01_H
 
 #include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
 
 /* MSP2 function codes sent by the MTF-01 */
 #define MSP2_SENSOR_RANGEFINDER  0x1F01
 #define MSP2_SENSOR_OPTIC_FLOW   0x1F02
 
-/* Minimum quality (0-255) required for status = 1.
- * The sensor firmware considers optical flow invalid below ~50;
- * rangefinder is valid whenever quality > 0.                    */
+/* Minimum signal quality (0-255) required for status = 1 */
 #define MSP2_FLOW_QUALITY_MIN   30
 #define MSP2_RANGE_QUALITY_MIN   1
 
@@ -42,10 +38,22 @@ typedef struct {
     uint32_t valid_packets;   /* successfully decoded packets */
 } MICOLINK_Stats_t;
 
+/* Called on every successfully decoded packet. Optional — see micolink_get_data(). */
 typedef void (*micolink_range_callback_t)(const MICOLINK_PAYLOAD_RANGE_SENSOR_t *payload);
 
-void micolink_set_range_callback(micolink_range_callback_t cb);
+/* Feed raw serial bytes one at a time; calls the callback on each complete packet. */
 void micolink_decode(uint8_t data);
+
+/* Register a callback to be invoked on each decoded packet. Pass NULL to disable. */
+void micolink_set_range_callback(micolink_range_callback_t cb);
+
+/* Poll the latest decoded data. Returns 1 if data is available, 0 if not yet. */
+int  micolink_get_data(MICOLINK_PAYLOAD_RANGE_SENSOR_t *out);
+
+/* Copy decoder statistics (packet counts, error counts) into *out. */
 void micolink_get_stats(MICOLINK_Stats_t *out);
+
+/* Reset decoder state, statistics, and stored data. */
+void micolink_reset(void);
 
 #endif

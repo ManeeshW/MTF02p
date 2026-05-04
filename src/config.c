@@ -17,6 +17,9 @@ int config_load(const char *path, Config *cfg) {
     strncpy(cfg->port, "/dev/cu.usbserial-TGJLZ4T1", CONFIG_MAX_PATH - 1);
     cfg->port[CONFIG_MAX_PATH - 1] = '\0';
     cfg->baud_rate = 115200;
+    cfg->sensor_hz = 50;
+    strncpy(cfg->zenoh_topic, "fdcl/mtf", CONFIG_MAX_PATH - 1);
+    cfg->zenoh_topic[CONFIG_MAX_PATH - 1] = '\0';
 
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -38,6 +41,11 @@ int config_load(const char *path, Config *cfg) {
             cfg->port[CONFIG_MAX_PATH - 1] = '\0';
         } else if (strcmp(key, "baud_rate") == 0) {
             cfg->baud_rate = atoi(val);
+        } else if (strcmp(key, "sensor_hz") == 0) {
+            cfg->sensor_hz = atoi(val);
+        } else if (strcmp(key, "zenoh_topic") == 0) {
+            strncpy(cfg->zenoh_topic, val, CONFIG_MAX_PATH - 1);
+            cfg->zenoh_topic[CONFIG_MAX_PATH - 1] = '\0';
         }
     }
 
